@@ -1,254 +1,226 @@
-"""Async multi-agent code review and optimization using a local vLLM endpoint.
+"""Async Code Optimizer & Review Agent.
 
-The agents use CrewAI, but every LLM call is routed to an OpenAI-compatible
-vLLM server running locally on AMD Radeon GPU / ROCm infrastructure.
+Ready-to-run demo for the live AMD Radeon Cloud vLLM endpoint.
+It uses the standard OpenAI-compatible async client, so it starts fast on
+Windows and avoids CrewAI's heavy import/logging overhead.
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
-import os
+import sys
 from dataclasses import dataclass
-from pathlib import Path
 from textwrap import dedent
-from typing import Any
 
 import httpx
-from crewai import Agent, LLM
-from dotenv import load_dotenv
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 
 
-DEFAULT_MODEL = "Qwen/Qwen2-7B-Instruct"
-DEFAULT_BASE_URL = "http://localhost:8000/v1"
+RADEON_CLOUD_BASE_URL = "https://radeon-global.anruicloud.com/spaces/u-13774-60d1b47b/8000/v1"
+RADEON_CLOUD_API_KEY = "sk-e63485ad8f8f796132c8650e888f5598af520ac4"
+MODEL_NAME = "Qwen/Qwen2-7B-Instruct"
 
-load_dotenv()
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-SAMPLE_CODE = dedent(
+SAMPLE_BAD_PYTHON_CODE = dedent(
     """
-    def find_duplicate_pairs(values):
-        pairs = []
-        seen = []
-        for i in range(len(values)):
-            for j in range(i + 1, len(values)):
-                if values[i] == values[j] and values[i] not in seen:
-                    pairs.append((values[i], i, j))
-            seen.append(values[i])
-        return pairs
+    def top_k_frequent_numbers(nums, k):
+        result = []
+        counts = {}
+
+        for n in nums:
+            if n in counts:
+                counts[n] = counts[n] + 1
+            else:
+                counts[n] = 1
+
+        # Bad: repeatedly scans all keys, mutates counts, and breaks when k is
+        # larger than the number of unique values.
+        for i in range(k):
+            best_number = None
+            best_count = -1
+            for number in counts:
+                if counts[number] > best_count:
+                    best_number = number
+                    best_count = counts[number]
+
+            result.append(best_number)
+            del counts[best_number]
+
+        return result
 
 
-    data = [3, 9, 3, 4, 9, 9, 1]
-    print(find_duplicate_pairs(data))
+    values = [4, 1, 2, 2, 3, 3, 3, 4, 4, 4]
+    print(top_k_frequent_numbers(values, 3))
     """
 ).strip()
 
 
 @dataclass(frozen=True)
-class OptimizerConfig:
-    """Runtime settings for the local OpenAI-compatible endpoint."""
-
-    model: str
-    base_url: str
-    api_key: str
-    temperature: float
-    timeout_seconds: int
+class RadeonCloudConfig:
+    base_url: str = RADEON_CLOUD_BASE_URL
+    api_key: str = RADEON_CLOUD_API_KEY
+    model: str = MODEL_NAME
+    temperature: float = 0.15
+    timeout_seconds: float = 180.0
 
 
-def load_config(model_override: str | None = None, base_url_override: str | None = None) -> OptimizerConfig:
-    return OptimizerConfig(
-        model=model_override or os.getenv("LOCAL_VLLM_MODEL", DEFAULT_MODEL),
-        base_url=(base_url_override or os.getenv("LOCAL_VLLM_BASE_URL", DEFAULT_BASE_URL)).rstrip("/"),
-        api_key=os.getenv("LOCAL_VLLM_API_KEY", "EMPTY"),
-        temperature=float(os.getenv("LLM_TEMPERATURE", "0.15")),
-        timeout_seconds=int(os.getenv("LLM_TIMEOUT_SECONDS", "180")),
-    )
+@dataclass(frozen=True)
+class AsyncCodeAgent:
+    name: str
+    system_prompt: str
+    client: AsyncOpenAI
+    config: RadeonCloudConfig
+
+    async def run(self, user_prompt: str) -> str:
+        print(f"{self.name}: running...")
+        response = await self.client.chat.completions.create(
+            model=self.config.model,
+            temperature=self.config.temperature,
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        content = response.choices[0].message.content
+        return (content or "").strip()
 
 
-def build_llm(config: OptimizerConfig) -> LLM:
-    """Create a CrewAI LLM client pinned to the local vLLM OpenAI API."""
-
-    return LLM(
-        model=f"openai/{config.model}",
+def build_client(config: RadeonCloudConfig) -> AsyncOpenAI:
+    return AsyncOpenAI(
         base_url=config.base_url,
         api_key=config.api_key,
-        temperature=config.temperature,
         timeout=config.timeout_seconds,
     )
 
 
-def build_agents(llm: LLM) -> tuple[Agent, Agent, Agent]:
-    logic_reviewer = Agent(
-        role="Logic Reviewer",
-        goal="Find correctness bugs, hidden edge cases, and unsafe assumptions in submitted Python or C++ code.",
-        backstory=(
-            "You are a senior software correctness reviewer. You focus on concrete failure modes, "
-            "minimal counterexamples, data-structure invariants, and behavioral regressions."
-        ),
-        llm=llm,
-        verbose=True,
-        allow_delegation=False,
-        max_iter=2,
-    )
-
-    performance_reviewer = Agent(
-        role="Performance Reviewer",
-        goal="Identify latency bottlenecks and practical low-level improvements without changing required behavior.",
-        backstory=(
-            "You are an AMD ROCm performance engineer who reviews hot paths, allocations, loop structure, "
-            "branching, cache behavior, and algorithmic complexity for production code."
-        ),
-        llm=llm,
-        verbose=True,
-        allow_delegation=False,
-        max_iter=2,
-    )
-
-    code_optimizer = Agent(
-        role="Code Optimizer",
-        goal="Rewrite code to be correct, readable, and low latency while preserving the public behavior.",
-        backstory=(
-            "You are a pragmatic optimization engineer. You merge review findings, keep the rewrite compact, "
-            "and explain only the changes that materially affect correctness or latency."
-        ),
-        llm=llm,
-        verbose=True,
-        allow_delegation=False,
-        max_iter=3,
-    )
-
-    return logic_reviewer, performance_reviewer, code_optimizer
-
-
-def result_text(result: Any) -> str:
-    return str(getattr(result, "raw", result)).strip()
-
-
-def fenced_code(code: str, language: str) -> str:
-    return f"```{language}\n{code.strip()}\n```"
-
-
-async def assert_vllm_ready(config: OptimizerConfig) -> None:
-    models_url = f"{config.base_url}/models"
+async def check_server_connection(config: RadeonCloudConfig) -> None:
     headers = {"Authorization": f"Bearer {config.api_key}"}
-    async with httpx.AsyncClient(timeout=15) as client:
-        response = await client.get(models_url, headers=headers)
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.get(f"{config.base_url}/models", headers=headers)
         response.raise_for_status()
 
 
-async def run_async_code_optimizer(code: str, language: str, config: OptimizerConfig) -> dict[str, str]:
-    llm = build_llm(config)
-    logic_reviewer, performance_reviewer, code_optimizer = build_agents(llm)
+async def run_async_workflow(source_code: str) -> str:
+    config = RadeonCloudConfig()
+    client = build_client(config)
 
-    code_block = fenced_code(code, language)
-
-    logic_prompt = dedent(
-        f"""
-        Review this {language} code for correctness only.
-
-        Return exactly these sections:
-        1. Bugs or edge cases
-        2. Minimal failing examples, if any
-        3. Behavior that must be preserved
-
-        Be specific and avoid generic advice.
-
-        {code_block}
-        """
-    ).strip()
-
-    performance_prompt = dedent(
-        f"""
-        Review this {language} code for low-latency execution.
-
-        Return exactly these sections:
-        1. Complexity and hot path
-        2. Avoidable allocations or repeated work
-        3. Recommended rewrite strategy
-
-        Prefer practical changes that preserve readability.
-
-        {code_block}
-        """
-    ).strip()
-
-    logic_task, performance_task = await asyncio.gather(
-        logic_reviewer.kickoff_async(logic_prompt),
-        performance_reviewer.kickoff_async(performance_prompt),
+    reviewer_agent = AsyncCodeAgent(
+        name="Reviewer Agent",
+        system_prompt=(
+            "You are a senior AI code-review engineer. Review Python code for "
+            "correctness bugs, edge cases, algorithmic complexity, avoidable "
+            "allocations, and latency bottlenecks. Be concrete and concise."
+        ),
+        client=client,
+        config=config,
     )
 
-    logic_review = result_text(logic_task)
-    performance_review = result_text(performance_task)
+    optimizer_agent = AsyncCodeAgent(
+        name="Optimizer Agent",
+        system_prompt=(
+            "You are a performance-focused software engineer. Rewrite Python code "
+            "into a correct, readable, low-latency implementation. Preserve intended "
+            "behavior, fix proven bugs, and explain changes briefly."
+        ),
+        client=client,
+        config=config,
+    )
+
+    print("Connecting to AMD Radeon Cloud vLLM endpoint...")
+    print(f"Base URL: {config.base_url}")
+    print(f"Model: {config.model}")
+    await check_server_connection(config)
+    print("Connection check passed.\n")
+
+    review_prompt = dedent(
+        f"""
+        Review this Python code for correctness and performance.
+
+        Return exactly these sections:
+        1. Correctness issues
+        2. Performance bottlenecks
+        3. Required behavior to preserve
+        4. Rewrite strategy
+
+        Code:
+        ```python
+        {source_code}
+        ```
+        """
+    ).strip()
+
+    review_text = await reviewer_agent.run(review_prompt)
+    print("Reviewer Agent: done.\n")
 
     optimizer_prompt = dedent(
         f"""
-        Rewrite the original {language} code using the two reviews.
+        Use the review below to produce a complete optimized replacement.
 
         Requirements:
-        - Preserve intended behavior unless a review proves the behavior is a bug.
-        - Improve asymptotic complexity or constant factors where possible.
-        - Return a complete replacement program or function.
-        - Include a short rationale after the code.
-        - Do not mention public cloud APIs; this system runs on local vLLM.
+        - Return runnable Python code.
+        - Preserve intended output for valid inputs.
+        - For this sample, the expected output is [4, 3, 2].
+        - Sort primarily by descending frequency.
+        - If frequencies tie, preserve the first-seen order from the input list.
+        - Handle k larger than the number of unique values.
+        - Improve avoidable repeated scans or unnecessary mutations.
+        - Do not reverse the final top-k list unless the original behavior requires it.
+        - After the code, add a short "Why this is better" section.
 
         Original code:
-        {code_block}
+        ```python
+        {source_code}
+        ```
 
-        Logic Reviewer findings:
-        {logic_review}
-
-        Performance Reviewer findings:
-        {performance_review}
+        Reviewer Agent findings:
+        {review_text}
         """
     ).strip()
 
-    optimized = await code_optimizer.kickoff_async(optimizer_prompt)
-
-    return {
-        "logic_review": logic_review,
-        "performance_review": performance_review,
-        "optimized_code": result_text(optimized),
-    }
+    optimized_output = await optimizer_agent.run(optimizer_prompt)
+    print("Optimizer Agent: done.")
+    return optimized_output
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run an async local multi-agent code optimizer.")
-    parser.add_argument("--file", type=Path, help="Python or C++ file to review. Uses a sample snippet when omitted.")
-    parser.add_argument("--language", default="python", choices=["python", "cpp"], help="Input code language.")
-    parser.add_argument("--model", help=f"Model name served by vLLM. Default: {DEFAULT_MODEL}")
-    parser.add_argument("--base-url", help=f"OpenAI-compatible vLLM base URL. Default: {DEFAULT_BASE_URL}")
-    parser.add_argument("--skip-health-check", action="store_true", help="Skip the /v1/models readiness check.")
-    return parser.parse_args()
+async def main_async() -> None:
+    print("=== Async Code Optimizer & Review Agent ===\n")
+    print("=== Input Code ===\n")
+    print(SAMPLE_BAD_PYTHON_CODE)
+    print()
 
+    try:
+        optimized_output = await run_async_workflow(SAMPLE_BAD_PYTHON_CODE)
+    except httpx.HTTPStatusError as exc:
+        print("Remote vLLM endpoint returned an HTTP error.")
+        print(f"Status code: {exc.response.status_code}")
+        print(f"Response: {exc.response.text[:500]}")
+        return
+    except (httpx.RequestError, APIConnectionError, APITimeoutError) as exc:
+        print("Could not connect to the AMD Radeon Cloud vLLM endpoint.")
+        print(f"Details: {exc}")
+        return
+    except APIStatusError as exc:
+        print("The remote model API returned an error.")
+        print(f"Status code: {exc.status_code}")
+        print(f"Response: {exc.response.text[:500]}")
+        return
+    except Exception as exc:
+        print("The async agent workflow failed.")
+        print(f"Details: {exc}")
+        return
 
-async def async_main() -> None:
-    args = parse_args()
-    config = load_config(model_override=args.model, base_url_override=args.base_url)
-
-    code = SAMPLE_CODE
-    if args.file:
-        code = args.file.read_text(encoding="utf-8")
-        if args.language == "python" and args.file.suffix in {".cc", ".cpp", ".cxx", ".hpp", ".h"}:
-            args.language = "cpp"
-
-    print(f"Using local vLLM endpoint: {config.base_url}")
-    print(f"Using model: {config.model}")
-
-    if not args.skip_health_check:
-        await assert_vllm_ready(config)
-
-    result = await run_async_code_optimizer(code=code, language=args.language, config=config)
-
-    print("\n=== Logic Review ===\n")
-    print(result["logic_review"])
-    print("\n=== Performance Review ===\n")
-    print(result["performance_review"])
-    print("\n=== Optimized Output ===\n")
-    print(result["optimized_code"])
+    print("\n=== Final Optimized Output ===\n")
+    print(optimized_output)
 
 
 def main() -> None:
-    asyncio.run(async_main())
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":

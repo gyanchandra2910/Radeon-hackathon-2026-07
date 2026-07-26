@@ -7,9 +7,11 @@ AMD AI DevMaster Hackathon
 
 Async Code Optimizer & Review Agent is a locally deployed multi-agent application that reviews Python or C++ source code for correctness risks, performance bottlenecks, and low-latency rewrite opportunities. The agents run asynchronously with CrewAI and call a local OpenAI-compatible vLLM endpoint hosted on an AMD Radeon GPU through ROCm.
 
-Video demo: `<PASTE_DEMO_VIDEO_LINK_HERE>`
+Video demo: `https://drive.google.com/file/d/1aUx9utGAgvFC5h1i5Mqe4gvzqEnkt1Ro/view?usp=sharing`
 
-Architecture diagram: `<PASTE_ARCHITECTURE_DIAGRAM_LINK_OR_IMAGE_HERE>`
+Architecture diagram:
+![Architecture Diagram](architecture.png)
+![Project Poster](poster.png)
 
 ## Core Capabilities
 
@@ -143,7 +145,8 @@ The program prints:
 ## Submission Notes
 
 - Pull request title: `Track 2, <TEAM_NAME>, Async Code Optimizer & Review Agent`
-- Demo video: `<PASTE_DEMO_VIDEO_LINK_HERE>`
-- Architecture diagram: `<PASTE_ARCHITECTURE_DIAGRAM_LINK_OR_IMAGE_HERE>`
-- Team members and responsibilities: `<PASTE_TEAM_INFO_HERE>`
-
+- Demo video: `https://drive.google.com/file/d/1aUx9utGAgvFC5h1i5Mqe4gvzqEnkt1Ro/view?usp=sharing`
+- Architecture diagram:
+![Architecture Diagram](architecture.png)
+![Project Poster](poster.png)
+- Team members and responsibilities: `Gyan Chandra - IIITDM Kancheepuram (Track 2: Localized AI Agents Deployment)`
