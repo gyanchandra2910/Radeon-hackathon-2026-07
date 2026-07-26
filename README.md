@@ -11,7 +11,6 @@ Video demo: `https://drive.google.com/file/d/1aUx9utGAgvFC5h1i5Mqe4gvzqEnkt1Ro/v
 
 Architecture diagram:
 ![Architecture Diagram](architecture.png)
-![Project Poster](poster.png)
 
 ## Core Capabilities
 
