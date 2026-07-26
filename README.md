@@ -147,5 +147,6 @@ The program prints:
 - Demo video: `https://drive.google.com/file/d/1aUx9utGAgvFC5h1i5Mqe4gvzqEnkt1Ro/view?usp=sharing`
 - Architecture diagram:
 ![Architecture Diagram](architecture.png)
+- Project Poster:
 ![Project Poster](poster.png)
 - Team members and responsibilities: `Gyan Chandra - IIITDM Kancheepuram (Track 2: Localized AI Agents Deployment)`
